@@ -1,24 +1,30 @@
+# Dataset utils and dataloaders
+
 import glob
+import math
 import os
 import random
 import shutil
 import time
+from itertools import repeat
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from threading import Thread
 
 import cv2
-import math
 import numpy as np
 import torch
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.general import xyxy2xywh, xywh2xyxy, torch_distributed_zero_first
+from utils.general import xyxy2xywh, xywh2xyxy
+from utils.torch_utils import torch_distributed_zero_first
 
+# Parameters
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
-vid_formats = ['.mov', '.avi', '.mp4', '.mpg', '.mpeg', '.m4v', '.wmv', '.mkv']
+img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng']  # acceptable image suffixes
+vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -48,7 +54,7 @@ def exif_size(img):
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8):
-    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache.
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
                                       augment=augment,  # augment images
@@ -73,9 +79,9 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
-    """ Dataloader that reuses workers.
+    """ Dataloader that reuses workers
 
-    Uses same syntax as vanilla DataLoader.
+    Uses same syntax as vanilla DataLoader
     """
 
     def __init__(self, *args, **kwargs):
@@ -92,7 +98,7 @@ class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
 
 
 class _RepeatSampler(object):
-    """ Sampler that repeats forever.
+    """ Sampler that repeats forever
 
     Args:
         sampler (Sampler)
@@ -119,8 +125,8 @@ class LoadImages:  # for inference
         else:
             raise Exception('ERROR: %s does not exist' % p)
 
-        images = [x for x in files if os.path.splitext(x)[-1].lower() in img_formats]
-        videos = [x for x in files if os.path.splitext(x)[-1].lower() in vid_formats]
+        images = [x for x in files if x.split('.')[-1].lower() in img_formats]
+        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]
         ni, nv = len(images), len(videos)
 
         self.img_size = img_size
@@ -175,7 +181,6 @@ class LoadImages:  # for inference
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return path, img, img0, self.cap
 
     def new_video(self, path):
@@ -188,22 +193,14 @@ class LoadImages:  # for inference
 
 
 class LoadWebcam:  # for inference
-    def __init__(self, pipe=0, img_size=640):
+    def __init__(self, pipe='0', img_size=640):
         self.img_size = img_size
 
-        if pipe == '0':
-            pipe = 0  # local camera
+        if pipe.isnumeric():
+            pipe = eval(pipe)  # local camera
         # pipe = 'rtsp://192.168.1.64/1'  # IP camera
         # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-        # pipe = 'rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa'  # IP traffic camera
         # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
-
-        # https://answers.opencv.org/question/215996/changing-gstreamer-pipeline-to-opencv-in-pythonsolved/
-        # pipe = '"rtspsrc location="rtsp://username:password@192.168.1.64/1" latency=10 ! appsink'  # GStreamer
-
-        # https://answers.opencv.org/question/200787/video-acceleration-gstremer-pipeline-in-videocapture/
-        # https://stackoverflow.com/questions/54095699/install-gstreamer-support-for-opencv-python-package  # install help
-        # pipe = "rtspsrc location=rtsp://root:root@192.168.0.91:554/axis-media/media.amp?videocodec=h264&resolution=3840x2160 protocols=GST_RTSP_LOWER_TRANS_TCP ! rtph264depay ! queue ! vaapih264dec ! videoconvert ! appsink"  # GStreamer
 
         self.pipe = pipe
         self.cap = cv2.VideoCapture(pipe)  # video capture object
@@ -340,24 +337,23 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         def img2label_paths(img_paths):
             # Define label paths as a function of image paths
             sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
-            return [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in img_paths]
+            return [x.replace(sa, sb, 1).replace('.' + x.split('.')[-1], '.txt') for x in img_paths]
 
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
-                p = str(Path(p))  # os-agnostic
-                parent = str(Path(p).parent) + os.sep
-                if os.path.isfile(p):  # file
+                p = Path(p)  # os-agnostic
+                if p.is_dir():  # dir
+                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                elif p.is_file():  # file
                     with open(p, 'r') as t:
                         t = t.read().splitlines()
+                        parent = str(p.parent) + os.sep
                         f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                elif os.path.isdir(p):  # folder
-                    f += glob.iglob(p + os.sep + '*.*')
                 else:
                     raise Exception('%s does not exist' % p)
-            self.img_files = sorted(
-                [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats])
-            assert len(self.img_files) > 0, 'No images found'
+            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
+            assert self.img_files, 'No images found'
         except Exception as e:
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
@@ -474,10 +470,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.imgs = [None] * n
         if cache_images:
             gb = 0  # Gigabytes of cached images
-            pbar = tqdm(range(len(self.img_files)), desc='Caching images')
             self.img_hw0, self.img_hw = [None] * n, [None] * n
-            for i in pbar:  # max 10k images
-                self.imgs[i], self.img_hw0[i], self.img_hw[i] = load_image(self, i)  # img, hw_original, hw_resized
+            results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
+            pbar = tqdm(enumerate(results), total=n)
+            for i, x in pbar:
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
                 gb += self.imgs[i].nbytes
                 pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
 
@@ -892,54 +889,16 @@ def cutout(image, labels):
     return labels
 
 
-def reduce_img_size(path='path/images', img_size=1024):  # from utils.datasets import *; reduce_img_size()
-    # creates a new ./images_reduced folder with reduced size images of maximum size img_size
-    path_new = path + '_reduced'  # reduced images path
-    create_folder(path_new)
-    for f in tqdm(glob.glob('%s/*.*' % path)):
-        try:
-            img = cv2.imread(f)
-            h, w = img.shape[:2]
-            r = img_size / max(h, w)  # size ratio
-            if r < 1.0:
-                img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # _LINEAR fastest
-            fnew = f.replace(path, path_new)  # .replace(Path(f).suffix, '.jpg')
-            cv2.imwrite(fnew, img)
-        except:
-            print('WARNING: image failure %s' % f)
-
-
-def recursive_dataset2bmp(dataset='path/dataset_bmp'):  # from utils.datasets import *; recursive_dataset2bmp()
-    # Converts dataset to bmp (for faster training)
-    formats = [x.lower() for x in img_formats] + [x.upper() for x in img_formats]
-    for a, b, files in os.walk(dataset):
-        for file in tqdm(files, desc=a):
-            p = a + '/' + file
-            s = Path(file).suffix
-            if s == '.txt':  # replace text
-                with open(p, 'r') as f:
-                    lines = f.read()
-                for f in formats:
-                    lines = lines.replace(f, '.bmp')
-                with open(p, 'w') as f:
-                    f.write(lines)
-            elif s in formats:  # replace image
-                cv2.imwrite(p.replace(s, '.bmp'), cv2.imread(p))
-                if s != '.bmp':
-                    os.system("rm '%s'" % p)
-
-
-def imagelist2folder(path='path/images.txt'):  # from utils.datasets import *; imagelist2folder()
-    # Copies all the images in a text file (list of images) into a folder
-    create_folder(path[:-4])
-    with open(path, 'r') as f:
-        for line in f.read().splitlines():
-            os.system('cp "%s" %s' % (line, path[:-4]))
-            print(line)
-
-
 def create_folder(path='./new'):
     # Create folder
     if os.path.exists(path):
         shutil.rmtree(path)  # delete output folder
     os.makedirs(path)  # make new output folder
+
+
+def flatten_recursive(path='../coco128'):
+    # Flatten a recursive directory by bringing all files to top level
+    new_path = Path(path + '_flat')
+    create_folder(new_path)
+    for file in tqdm(glob.glob(str(Path(path)) + '/**/*.*', recursive=True)):
+        shutil.copyfile(file, new_path / Path(file).name)
